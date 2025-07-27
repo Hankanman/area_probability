@@ -16,10 +16,9 @@ from db import AreaEntityConfig, AreaOccupancy, AreaTimePriors, StateInterval
 def compute_time_priors(session, entry_id: str, slot_minutes: int = 60):
     """
     Estimate P(occupied) per day_of_week and time_slot from motion sensor intervals.
-    OPTIMIZED VERSION: Uses single aggregated query and reduces memory overhead.
     """
     # Use a single optimized query with aggregation to reduce data transfer
-    # This replaces loading all intervals into memory
+    # This prevents loading all intervals into memory
     interval_aggregates = (
         session.query(
             func.extract("dow", StateInterval.start_time).label("day_of_week"),
@@ -102,7 +101,6 @@ def compute_entity_likelihoods(session, entry_id: str):
     """
     Compute P(sensor=true|occupied) and P(sensor=true|empty) per sensor.
     Use motion-based labels for 'occupied'.
-    OPTIMIZED VERSION: Eliminates N+1 queries and uses efficient temporal search.
     """
     # Get all sensor configs for this area
     sensors = session.query(AreaEntityConfig).filter_by(entry_id=entry_id).all()
@@ -139,8 +137,6 @@ def compute_entity_likelihoods(session, entry_id: str):
 
         return False
 
-    # OPTIMIZATION: Single query to get all state intervals for all sensors at once
-    # This eliminates the N+1 query problem
     sensor_entity_ids = [cfg.entity_id for cfg in sensors]
     if not sensor_entity_ids:
         return sensors
@@ -219,7 +215,6 @@ def forward_hmm(
     """
     Run HMM forward algorithm over a time grid of features,
     using time priors as initial state probabilities and a learned transition matrix.
-    OPTIMIZED VERSION: Pre-loads configs once and uses batch processing.
     """
     # Pre-load priors and configs once (instead of querying repeatedly)
     priors_query = session.query(AreaTimePriors).filter_by(entry_id=entry_id).all()
