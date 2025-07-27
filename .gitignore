@@ -1,0 +1,26 @@
+# artifacts
+__pycache__
+.pytest*
+*.egg-info
+*/build/*
+*/dist/*
+
+
+# misc
+.coverage
+coverage.xml
+.ruff_cache
+.mypy_cache
+
+# Home Assistant configuration
+config/*
+!config/configuration.yaml
+
+# Python Environment
+.venv
+commit_messages.txt
+release_diff.txt
+
+# SQL
+*.db
+*.sql

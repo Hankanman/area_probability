@@ -1,0 +1,20 @@
+{
+  // Disable pylint
+  "python.linting.pylintEnabled": false,
+  "python.linting.enabled": false,
+
+  // Enable ruff as the linter
+  "ruff.enable": true,
+  "ruff.lint.enable": true,
+  "ruff.format.enable": true,
+
+  // Set ruff as the default formatter
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.codeActionsOnSave": {
+      "source.fixAll.ruff": "explicit",
+      "source.organizeImports.ruff": "explicit"
+    }
+  }
+}
