@@ -222,20 +222,60 @@ def cmd_predict(args):
         # Generate entities from database
         entities = generate_entities_from_db(storage, entry_id)
 
+        # Get area prior and time prior for this timestamp
+        area = storage.get_area_by_identifier(entry_id)
+        area_prior = area.area_prior if area else 0.5
+        time_prior = storage.get_time_prior_at_timestamp(entry_id, timestamp)
+        print(f"Area prior: {area_prior:.3f}")
+        print(f"Time prior for this time: {time_prior:.3f}")
+
+        # Calculate combined prior
+        combined_prior = area_prior * time_prior / 0.5
+        combined_prior = max(0.001, min(0.999, combined_prior))
+        print(f"Combined prior: {combined_prior:.3f}")
+
         # Update evidence based on sensor state at the random timestamp
         for entity_id, entity in entities.items():
             # Get sensor state at this timestamp
             sensor_state = storage.get_sensor_state_at_time(entity_id, timestamp)
             entity.evidence = sensor_state == "on"
 
-        # Display entities and evidence used
+        # Display entities and evidence used in a table
         print("\nEntities and evidence used:")
+        print(
+            f"{'Entity ID':<60} {'Evidence':<8} {'Decay':<6} {'P(True)':<8} {'P(False)':<8}"
+        )
+        print("-" * 100)
+
         for entity_id, entity in entities.items():
             evidence_str = "ON" if entity.evidence else "OFF"
-            print(f"  {entity_id}: {evidence_str}")
+            decay_str = f"{entity.decay.decay_factor:.3f}"
 
-        # Make prediction
-        p = naive_bayes_predict(entities)
+            # Calculate probabilities for display
+            if entity.evidence:
+                p_true = entity.likelihood.prob_given_true
+                p_false = entity.likelihood.prob_given_false
+            else:
+                # Apply decay to negative evidence
+                neutral_prob = 0.5
+                full_negative_t = 1 - entity.likelihood.prob_given_true
+                full_negative_f = 1 - entity.likelihood.prob_given_false
+
+                p_true = (
+                    neutral_prob
+                    + (full_negative_t - neutral_prob) * entity.decay.decay_factor
+                )
+                p_false = (
+                    neutral_prob
+                    + (full_negative_f - neutral_prob) * entity.decay.decay_factor
+                )
+
+            print(
+                f"{entity_id:<60} {evidence_str:<8} {decay_str:<6} {p_true:<8.3f} {p_false:<8.3f}"
+            )
+
+        # Make prediction with area prior and time prior
+        p = naive_bayes_predict(entities, area_prior, time_prior)
         print(f"\nNaïve Bayes P(occupied) = {p:.3f}")
 
     except ValueError as e:

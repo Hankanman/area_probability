@@ -144,35 +144,60 @@ def compute_entity_likelihoods(storage: AreaOccupancyStorage, entry_id: str):
     return sensors
 
 
-def naive_bayes_predict(entities: Dict[str, Entity]):
+def naive_bayes_predict(
+    entities: Dict[str, Entity], area_prior: float = 0.5, time_prior: float = 0.5
+):
     """
-    Compute posterior probability of occupancy given current features.
+    Compute posterior probability of occupancy given current features, area prior, and time prior.
 
     Args:
         entities: Dict mapping entity_id to Entity objects containing evidence and likelihood
+        area_prior: Base prior probability of occupancy for this area (default: 0.5)
+        time_prior: Time-based modifier for the prior (default: 0.5)
     """
+    # Clamp priors to avoid log(0) or log(1)
+    area_prior = max(0.001, min(0.999, area_prior))
+    time_prior = max(0.001, min(0.999, time_prior))
+
+    # Combine area prior with time prior modifier
+    # Use time_prior as a multiplier on the area_prior
+    combined_prior = area_prior * time_prior / 0.5  # Normalize by default time prior
+
+    # Clamp combined prior
+    combined_prior = max(0.001, min(0.999, combined_prior))
+
     # log-space for numerical stability
-    log_true = 0.0
-    log_false = 0.0
+    log_true = math.log(combined_prior)
+    log_false = math.log(1 - combined_prior)
+
     for entity in entities.values():
         value = entity.evidence
-        p_t = (
-            entity.likelihood.prob_given_true
-            if value
-            else 1 - entity.likelihood.prob_given_true
-        )
-        p_f = (
-            entity.likelihood.prob_given_false
-            if value
-            else 1 - entity.likelihood.prob_given_false
-        )
+        decay_factor = entity.decay.decay_factor
+
+        # Apply decay to evidence strength
+        # When evidence is True: decay_factor = 1.0 (full strength)
+        # When evidence is False: decay_factor reduces over time (weakening negative evidence)
+        if value:
+            # Evidence is present - use full strength
+            p_t = entity.likelihood.prob_given_true
+            p_f = entity.likelihood.prob_given_false
+        else:
+            # Evidence is absent - apply decay to weaken the negative evidence
+            # Interpolate between neutral (0.5) and full negative evidence based on decay
+            neutral_prob = 0.5
+            full_negative_t = 1 - entity.likelihood.prob_given_true
+            full_negative_f = 1 - entity.likelihood.prob_given_false
+
+            p_t = neutral_prob + (full_negative_t - neutral_prob) * decay_factor
+            p_f = neutral_prob + (full_negative_f - neutral_prob) * decay_factor
 
         # Clamp probabilities to avoid log(0) or log(1)
         p_t = max(0.001, min(0.999, p_t))
         p_f = max(0.001, min(0.999, p_f))
 
-        log_true += math.log(p_t) * entity.weight
-        log_false += math.log(p_f) * entity.weight
+        log_true += math.log(p_t) * entity.entity_type.weight
+        log_false += math.log(p_f) * entity.entity_type.weight
+
     # convert back
     max_log = max(log_true, log_false)
     true_prob = math.exp(log_true - max_log)

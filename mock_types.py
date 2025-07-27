@@ -40,6 +40,17 @@ class EntityType:
         self.weight = weight
 
 
+class Decay:
+    """Decay."""
+
+    decay_factor: float
+    is_decaying: bool
+
+    def __init__(self, decay_factor: float, is_decaying: bool):
+        self.decay_factor = decay_factor
+        self.is_decaying = is_decaying
+
+
 class Entity:
     """Type definition for a feature used in occupancy prediction."""
 
@@ -61,3 +72,12 @@ class Entity:
         self.weight = weight
         self.likelihood = likelihood
         self.evidence = random.choice([True, False])
+        self.decay = self.get_decay()
+
+    def get_decay(self):
+        """Decay the evidence."""
+        if self.evidence:
+            return Decay(decay_factor=1.0, is_decaying=False)
+        decay_factor = random.uniform(0.0, 1.0)
+        is_decaying = decay_factor > 0.0
+        return Decay(decay_factor=decay_factor, is_decaying=is_decaying)

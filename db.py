@@ -654,6 +654,33 @@ class AreaOccupancyStorage:
             self.rollback()
             raise e
 
+    def get_time_prior_at_timestamp(
+        self, entry_id: str, timestamp, slot_minutes: int = 60
+    ):
+        """
+        Get the time prior for a specific timestamp.
+
+        Args:
+            entry_id: Area entry ID
+            timestamp: Timestamp to get prior for
+            slot_minutes: Time slot size in minutes
+
+        Returns:
+            float: Time prior value or default 0.5 if not found
+        """
+        # Calculate day of week and time slot
+        day_of_week = timestamp.weekday()  # 0=Monday, 6=Sunday
+        time_slot = (timestamp.hour * 60 + timestamp.minute) // slot_minutes
+
+        # Query for the specific time prior
+        prior = (
+            self.session.query(self.AreaTimePriors)
+            .filter_by(entry_id=entry_id, day_of_week=day_of_week, time_slot=time_slot)
+            .first()
+        )
+
+        return prior.prior_value if prior else 0.5
+
     def update_area_prior(self, entry_id: str, prior_value: float):
         """
         Update the area prior for a specific area.
