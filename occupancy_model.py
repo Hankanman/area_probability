@@ -10,7 +10,13 @@ from datetime import datetime, timezone
 import numpy as np
 from sqlalchemy import func
 
-from db import AreaEntityConfig, AreaOccupancy, AreaTimePriors, StateInterval
+from db import AreaOccupancyStorage
+
+# Get references to the model classes
+AreaEntityConfig = AreaOccupancyStorage.AreaEntityConfig
+AreaOccupancy = AreaOccupancyStorage.AreaOccupancy
+AreaTimePriors = AreaOccupancyStorage.AreaTimePriors
+StateInterval = AreaOccupancyStorage.StateInterval
 
 
 def compute_time_priors(session, entry_id: str, slot_minutes: int = 60):

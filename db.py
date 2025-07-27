@@ -19,12 +19,14 @@ from sqlalchemy import (
     create_engine,
     text,
 )
-from sqlalchemy.orm import relationship, sessionmaker
+from sqlalchemy.orm import declarative_base, relationship, sessionmaker
 
 if TYPE_CHECKING:
     from sqlalchemy.orm import DeclarativeBase
 
     Base = DeclarativeBase
+else:
+    Base = declarative_base()
 
 DEFAULT_AREA_PRIOR = 0.15
 DEFAULT_ENTITY_WEIGHT = 0.85

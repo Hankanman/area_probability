@@ -9,15 +9,7 @@ from pathlib import Path
 
 from sqlalchemy import func
 
-from db import (
-    AreaEntityConfig,
-    AreaOccupancy,
-    AreaTimePriors,
-    get_session,
-    import_from_sql,
-    init_db,
-    reset_learned_parameters,
-)
+from db import AreaOccupancyStorage
 from occupancy_model import (
     compute_entity_likelihoods,
     compute_time_priors,
@@ -25,6 +17,11 @@ from occupancy_model import (
     naive_bayes_predict,
     update_area_prior,
 )
+
+# Get references to the model classes
+AreaEntityConfig = AreaOccupancyStorage.AreaEntityConfig
+AreaOccupancy = AreaOccupancyStorage.AreaOccupancy
+AreaTimePriors = AreaOccupancyStorage.AreaTimePriors
 
 
 def resolve_area_id(session, area_identifier: str) -> str:
@@ -66,20 +63,23 @@ def resolve_area_id(session, area_identifier: str) -> str:
 
 def cmd_init(_):
     """Initialize the database schema."""
-    init_db()
+    storage = AreaOccupancyStorage()
+    storage.init_db()
     print("Database initialized.")
 
 
 def cmd_import(args):
     """Import data from SQL file into the database."""
-    _, message = import_from_sql(args.file)
+    storage = AreaOccupancyStorage()
+    success, message = storage.import_from_sql(args.file)
     print(message)
 
 
 def cmd_reset(_):
     """Delete all priors and likelihoods from the database."""
     try:
-        priors_deleted, configs_reset = reset_learned_parameters()
+        storage = AreaOccupancyStorage()
+        priors_deleted, configs_reset = storage.reset_learned_parameters()
         print(
             f"Deleted {priors_deleted} time priors and reset {configs_reset} entity likelihoods to default values."
         )
@@ -187,7 +187,8 @@ Database Schema:
 
 def cmd_priors(args):
     """Compute time-of-day occupancy priors for a specific area."""
-    session = get_session()
+    storage = AreaOccupancyStorage()
+    session = storage.get_session()
     try:
         entry_id = resolve_area_id(session, args.entry_id)
         session.query(AreaTimePriors).filter_by(entry_id=entry_id).delete()
@@ -203,7 +204,8 @@ def cmd_priors(args):
 
 def cmd_likelihoods(args):
     """Compute sensor likelihoods given occupancy for a specific area."""
-    session = get_session()
+    storage = AreaOccupancyStorage()
+    session = storage.get_session()
     try:
         entry_id = resolve_area_id(session, args.entry_id)
         configs = compute_entity_likelihoods(session, entry_id)
@@ -217,7 +219,8 @@ def cmd_likelihoods(args):
 
 def cmd_area_prior(args):
     """Compute area prior for a specific area."""
-    session = get_session()
+    storage = AreaOccupancyStorage()
+    session = storage.get_session()
     try:
         entry_id = resolve_area_id(session, args.entry_id)
         prior_value = update_area_prior(session, entry_id)
@@ -230,7 +233,8 @@ def cmd_area_prior(args):
 
 def cmd_predict(args):
     """Perform Naïve Bayes occupancy prediction using current sensor readings."""
-    session = get_session()
+    storage = AreaOccupancyStorage()
+    session = storage.get_session()
     try:
         entry_id = resolve_area_id(session, args.entry_id)
         features = dict(zip(args.entities, map(int, args.values)))
@@ -245,7 +249,8 @@ def cmd_predict(args):
 
 def cmd_hmm(args):
     """Run HMM-smoothed occupancy analysis over a timeline CSV."""
-    session = get_session()
+    storage = AreaOccupancyStorage()
+    session = storage.get_session()
     try:
         entry_id = resolve_area_id(session, args.entry_id)
         # simulate or load feature timeline
@@ -269,7 +274,8 @@ def cmd_hmm(args):
 
 def cmd_learn_all(args):
     """Compute priors and likelihoods for all areas."""
-    session = get_session()
+    storage = AreaOccupancyStorage()
+    session = storage.get_session()
     try:
         # Get all areas
         areas = session.query(AreaOccupancy).all()
