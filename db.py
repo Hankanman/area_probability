@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     UniqueConstraint,
     create_engine,
+    func,
     text,
 )
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
@@ -60,6 +61,9 @@ class AreaOccupancyStorage:
 
         # Check if database exists and initialize if needed
         self._ensure_db_exists()
+
+        # Create and store session
+        self.session = self.get_session()
 
     class AreaOccupancy(Base):
         """
@@ -210,6 +214,35 @@ class AreaOccupancyStorage:
         session = sessionmaker(bind=engine)
         return session()
 
+    def commit(self):
+        """
+        Commit the current session.
+        """
+        if self.session:
+            self.session.commit()
+
+    def rollback(self):
+        """
+        Rollback the current session.
+        """
+        if self.session:
+            self.session.rollback()
+
+    def close(self):
+        """
+        Close the current session.
+        """
+        if self.session:
+            self.session.close()
+            self.session = None
+
+    def refresh_session(self):
+        """
+        Create a new session if the current one is closed.
+        """
+        if not self.session:
+            self.session = self.get_session()
+
     def init_db(self):
         """
         Initialize the database.
@@ -223,28 +256,24 @@ class AreaOccupancyStorage:
         Returns:
             tuple: (priors_deleted: int, configs_reset: int)
         """
-        session = self.get_session()
-
         try:
             # Delete all time priors
-            priors_deleted = session.query(self.AreaTimePriors).delete()
+            priors_deleted = self.session.query(self.AreaTimePriors).delete()
 
             # Reset likelihoods to default values
-            configs = session.query(self.AreaEntityConfig).all()
+            configs = self.session.query(self.AreaEntityConfig).all()
             now = datetime.now(timezone.utc)
             for config in configs:
-                config.prob_given_true = self.DEFAULT_ENTITY_PROB_GIVEN_TRUE
-                config.prob_given_false = self.DEFAULT_ENTITY_PROB_GIVEN_FALSE
+                config.prob_given_true = DEFAULT_ENTITY_PROB_GIVEN_TRUE
+                config.prob_given_false = DEFAULT_ENTITY_PROB_GIVEN_FALSE
                 config.last_updated = now
 
-            session.commit()
+            self.commit()
             return priors_deleted, len(configs)
 
         except Exception as e:
-            session.rollback()
+            self.rollback()
             raise e
-        finally:
-            session.close()
 
     def import_from_sql(self, file_path: str):
         """
@@ -359,3 +388,290 @@ class AreaOccupancyStorage:
             )
 
             return result.rowcount
+
+    def get_area_by_identifier(self, area_identifier: str):
+        """
+        Get an area by entry_id or area_name (case-insensitive).
+
+        Args:
+            area_identifier: Area entry_id or area_name
+
+        Returns:
+            AreaOccupancy object or None if not found
+        """
+        # First try to find by entry_id (UUID) - exact match
+        area = (
+            self.session.query(self.AreaOccupancy)
+            .filter_by(entry_id=area_identifier)
+            .first()
+        )
+        if area:
+            return area
+
+        area = (
+            self.session.query(self.AreaOccupancy)
+            .filter(func.lower(self.AreaOccupancy.area_name) == area_identifier.lower())
+            .first()
+        )
+        return area
+
+    def get_all_areas(self):
+        """
+        Get all areas in the database.
+
+        Returns:
+            List of AreaOccupancy objects
+        """
+        return self.session.query(self.AreaOccupancy).all()
+
+    def get_area_entity_configs(self, entry_id: str):
+        """
+        Get all entity configurations for a specific area.
+
+        Args:
+            entry_id: Area entry ID
+
+        Returns:
+            List of AreaEntityConfig objects
+        """
+        return (
+            self.session.query(self.AreaEntityConfig).filter_by(entry_id=entry_id).all()
+        )
+
+    def get_motion_sensor_intervals(self, entry_id: str):
+        """
+        Get all motion sensor intervals for a specific area.
+
+        Args:
+            entry_id: Area entry ID
+
+        Returns:
+            List of (start_time, end_time) tuples
+        """
+        intervals = (
+            self.session.query(
+                self.StateInterval.start_time, self.StateInterval.end_time
+            )
+            .join(
+                self.AreaEntityConfig,
+                self.StateInterval.entity_id == self.AreaEntityConfig.entity_id,
+            )
+            .filter(
+                self.AreaEntityConfig.entry_id == entry_id,
+                self.AreaEntityConfig.entity_type == "motion",
+                self.StateInterval.state == "on",
+            )
+            .order_by(self.StateInterval.start_time)
+            .all()
+        )
+        return [(start, end) for start, end in intervals]
+
+    def get_interval_aggregates(self, entry_id: str, slot_minutes: int = 60):
+        """
+        Get aggregated interval data for time prior computation.
+
+        Args:
+            entry_id: Area entry ID
+            slot_minutes: Time slot size in minutes
+
+        Returns:
+            List of (day_of_week, time_slot, total_occupied_seconds) tuples
+        """
+
+        interval_aggregates = (
+            self.session.query(
+                func.extract("dow", self.StateInterval.start_time).label("day_of_week"),
+                func.floor(
+                    (
+                        func.extract("hour", self.StateInterval.start_time) * 60
+                        + func.extract("minute", self.StateInterval.start_time)
+                    )
+                    / slot_minutes
+                ).label("time_slot"),
+                func.sum(self.StateInterval.duration_seconds).label(
+                    "total_occupied_seconds"
+                ),
+            )
+            .join(
+                self.AreaEntityConfig,
+                self.StateInterval.entity_id == self.AreaEntityConfig.entity_id,
+            )
+            .filter(
+                self.AreaEntityConfig.entry_id == entry_id,
+                self.AreaEntityConfig.entity_type == "motion",
+                self.StateInterval.state == "on",
+            )
+            .group_by("day_of_week", "time_slot")
+            .all()
+        )
+        return [
+            (day, slot, total_seconds)
+            for day, slot, total_seconds in interval_aggregates
+        ]
+
+    def get_time_bounds(self, entry_id: str):
+        """
+        Get time bounds for a specific area.
+
+        Args:
+            entry_id: Area entry ID
+
+        Returns:
+            Tuple of (first_time, last_time) or (None, None) if no data
+        """
+
+        time_bounds = (
+            self.session.query(
+                func.min(self.StateInterval.start_time).label("first"),
+                func.max(self.StateInterval.end_time).label("last"),
+            )
+            .join(
+                self.AreaEntityConfig,
+                self.StateInterval.entity_id == self.AreaEntityConfig.entity_id,
+            )
+            .filter(self.AreaEntityConfig.entry_id == entry_id)
+            .first()
+        )
+        return (time_bounds.first, time_bounds.last) if time_bounds else (None, None)
+
+    def get_sensor_intervals(self, entity_ids: list[str]):
+        """
+        Get all intervals for specific sensor entities.
+
+        Args:
+            entity_ids: List of entity IDs
+
+        Returns:
+            List of StateInterval objects
+        """
+        return (
+            self.session.query(self.StateInterval)
+            .filter(self.StateInterval.entity_id.in_(entity_ids))
+            .all()
+        )
+
+    def get_sensor_intervals_for_area(self, entry_id: str):
+        """
+        Get all sensor intervals for a specific area.
+
+        Args:
+            entry_id: Area entry ID
+
+        Returns:
+            List of StateInterval objects
+        """
+        return (
+            self.session.query(self.StateInterval)
+            .join(
+                self.AreaEntityConfig,
+                self.StateInterval.entity_id == self.AreaEntityConfig.entity_id,
+            )
+            .filter(self.AreaEntityConfig.entry_id == entry_id)
+            .all()
+        )
+
+    def get_sensor_state_at_time(self, entity_id: str, timestamp):
+        """
+        Get the sensor state at a specific timestamp.
+
+        Args:
+            entity_id: Entity ID
+            timestamp: Timestamp to check
+
+        Returns:
+            str: Sensor state ("on" or "off") or None if no data
+        """
+        interval = (
+            self.session.query(self.StateInterval)
+            .filter(
+                self.StateInterval.entity_id == entity_id,
+                self.StateInterval.start_time <= timestamp,
+                self.StateInterval.end_time > timestamp,
+            )
+            .first()
+        )
+        return interval.state if interval else None
+
+    def get_total_occupied_seconds(self, entry_id: str):
+        """
+        Get total occupied seconds for an area.
+
+        Args:
+            entry_id: Area entry ID
+
+        Returns:
+            Total occupied seconds or 0 if no data
+        """
+
+        occupied_result = (
+            self.session.query(func.sum(self.StateInterval.duration_seconds))
+            .join(
+                self.AreaEntityConfig,
+                self.StateInterval.entity_id == self.AreaEntityConfig.entity_id,
+            )
+            .filter(
+                self.AreaEntityConfig.entry_id == entry_id,
+                self.AreaEntityConfig.entity_type == "motion",
+                self.StateInterval.state == "on",
+            )
+            .scalar()
+        )
+        return float(occupied_result or 0)
+
+    def delete_area_time_priors(self, entry_id: str):
+        """
+        Delete all time priors for a specific area.
+
+        Args:
+            entry_id: Area entry ID
+
+        Returns:
+            Number of priors deleted
+        """
+        try:
+            deleted = (
+                self.session.query(self.AreaTimePriors)
+                .filter_by(entry_id=entry_id)
+                .delete()
+            )
+            self.commit()
+            return deleted
+        except Exception as e:
+            self.rollback()
+            raise e
+
+    def add_time_priors(self, priors: list):
+        """
+        Add time priors to the database.
+
+        Args:
+            priors: List of AreaTimePriors objects
+        """
+        try:
+            self.session.add_all(priors)
+            self.commit()
+        except Exception as e:
+            self.rollback()
+            raise e
+
+    def update_area_prior(self, entry_id: str, prior_value: float):
+        """
+        Update the area prior for a specific area.
+
+        Args:
+            entry_id: Area entry ID
+            prior_value: New prior value
+        """
+        try:
+            area = (
+                self.session.query(self.AreaOccupancy)
+                .filter_by(entry_id=entry_id)
+                .first()
+            )
+            if area:
+                area.area_prior = prior_value
+                area.updated_at = datetime.now(timezone.utc)
+                self.commit()
+        except Exception as e:
+            self.rollback()
+            raise e

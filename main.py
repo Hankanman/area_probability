@@ -3,33 +3,25 @@ This module provides a CLI for initializing, populating, and using the occupancy
 """
 
 import argparse
+import random
 import sys
-from datetime import datetime
-from pathlib import Path
-
-from sqlalchemy import func
 
 from db import AreaOccupancyStorage
 from occupancy_model import (
     compute_entity_likelihoods,
     compute_time_priors,
-    forward_hmm,
+    generate_entities_from_db,
     naive_bayes_predict,
     update_area_prior,
 )
 
-# Get references to the model classes
-AreaEntityConfig = AreaOccupancyStorage.AreaEntityConfig
-AreaOccupancy = AreaOccupancyStorage.AreaOccupancy
-AreaTimePriors = AreaOccupancyStorage.AreaTimePriors
 
-
-def resolve_area_id(session, area_identifier: str) -> str:
+def resolve_area_id(storage: AreaOccupancyStorage, area_identifier: str) -> str:
     """
     Resolve an area identifier (name or entry_id) to an entry_id.
 
     Args:
-        session: Database session
+        storage: AreaOccupancyStorage instance
         area_identifier: Area name or entry_id (case-insensitive)
 
     Returns:
@@ -38,23 +30,12 @@ def resolve_area_id(session, area_identifier: str) -> str:
     Raises:
         ValueError: If area is not found
     """
-
-    # First try to find by entry_id (UUID) - exact match
-    area = session.query(AreaOccupancy).filter_by(entry_id=area_identifier).first()
+    area = storage.get_area_by_identifier(area_identifier)
     if area:
         return area.entry_id
 
-    # If not found, try to find by area_name (case-insensitive)
-    area = (
-        session.query(AreaOccupancy)
-        .filter(func.lower(AreaOccupancy.area_name) == area_identifier.lower())
-        .first()
-    )
-    if area:
-        return area.entry_id
-
-    # If still not found, list available areas
-    areas = session.query(AreaOccupancy).all()
+    # If not found, list available areas
+    areas = storage.get_all_areas()
     available = [f"{a.area_name} (ID: {a.entry_id})" for a in areas]
     raise ValueError(
         f"Area '{area_identifier}' not found. Available areas:\n" + "\n".join(available)
@@ -188,97 +169,85 @@ Database Schema:
 def cmd_priors(args):
     """Compute time-of-day occupancy priors for a specific area."""
     storage = AreaOccupancyStorage()
-    session = storage.get_session()
     try:
-        entry_id = resolve_area_id(session, args.entry_id)
-        session.query(AreaTimePriors).filter_by(entry_id=entry_id).delete()
-        priors = compute_time_priors(session, entry_id, slot_minutes=args.slot)
-        session.add_all(priors)
-        session.commit()
+        entry_id = resolve_area_id(storage, args.entry_id)
+        storage.delete_area_time_priors(entry_id)
+        priors = compute_time_priors(storage, entry_id, slot_minutes=args.slot)
+        storage.commit()
         print(f"Populated {len(priors)} time priors for {args.entry_id}.")
     except ValueError as e:
         print(f"Error: {e}")
-    finally:
-        session.close()
 
 
 def cmd_likelihoods(args):
     """Compute sensor likelihoods given occupancy for a specific area."""
     storage = AreaOccupancyStorage()
-    session = storage.get_session()
     try:
-        entry_id = resolve_area_id(session, args.entry_id)
-        configs = compute_entity_likelihoods(session, entry_id)
-        session.commit()
+        entry_id = resolve_area_id(storage, args.entry_id)
+        configs = compute_entity_likelihoods(storage, entry_id)
+        storage.commit()
         print(f"Updated likelihoods for {len(configs)} sensors in {args.entry_id}.")
     except ValueError as e:
         print(f"Error: {e}")
-    finally:
-        session.close()
 
 
 def cmd_area_prior(args):
     """Compute area prior for a specific area."""
     storage = AreaOccupancyStorage()
-    session = storage.get_session()
     try:
-        entry_id = resolve_area_id(session, args.entry_id)
-        prior_value = update_area_prior(session, entry_id)
+        entry_id = resolve_area_id(storage, args.entry_id)
+        prior_value = update_area_prior(storage, entry_id)
         print(f"Updated area prior for {args.entry_id}: {prior_value:.3f}")
     except ValueError as e:
         print(f"Error: {e}")
-    finally:
-        session.close()
 
 
 def cmd_predict(args):
-    """Perform Naïve Bayes occupancy prediction using current sensor readings."""
+    """Perform Naïve Bayes occupancy prediction using random historical data."""
     storage = AreaOccupancyStorage()
-    session = storage.get_session()
     try:
-        entry_id = resolve_area_id(session, args.entry_id)
-        features = dict(zip(args.entities, map(int, args.values)))
-        configs = session.query(AreaEntityConfig).filter_by(entry_id=entry_id).all()
-        p = naive_bayes_predict(configs, features)
-        print(f"Naïve Bayes P(occupied) = {p:.3f}")
+        entry_id = resolve_area_id(storage, args.entry_id)
+
+        # Get a random point in time where there is data for this area
+        intervals = storage.get_sensor_intervals_for_area(entry_id)
+        if not intervals:
+            print(f"No sensor data found for area {args.entry_id}")
+            return
+
+        random_interval = random.choice(intervals)
+        timestamp = random_interval.start_time
+
+        print(f"Using data from {timestamp}")
+
+        # Generate entities from database
+        entities = generate_entities_from_db(storage, entry_id)
+
+        # Update evidence based on sensor state at the random timestamp
+        for entity_id, entity in entities.items():
+            # Get sensor state at this timestamp
+            sensor_state = storage.get_sensor_state_at_time(entity_id, timestamp)
+            entity.evidence = sensor_state == "on"
+
+        # Display entities and evidence used
+        print("\nEntities and evidence used:")
+        for entity_id, entity in entities.items():
+            evidence_str = "ON" if entity.evidence else "OFF"
+            print(f"  {entity_id}: {evidence_str}")
+
+        # Make prediction
+        p = naive_bayes_predict(entities)
+        print(f"\nNaïve Bayes P(occupied) = {p:.3f}")
+
     except ValueError as e:
         print(f"Error: {e}")
-    finally:
-        session.close()
-
-
-def cmd_hmm(args):
-    """Run HMM-smoothed occupancy analysis over a timeline CSV."""
-    storage = AreaOccupancyStorage()
-    session = storage.get_session()
-    try:
-        entry_id = resolve_area_id(session, args.entry_id)
-        # simulate or load feature timeline
-        # CSV input: timestamp,entity,value
-        timeline = []
-        with Path(args.timeline).open() as f:
-            for row in f:
-                ts_str, eid, val = row.strip().split(",")
-                ts = datetime.fromisoformat(ts_str)
-            if not timeline or timeline[-1][0] != ts:
-                timeline.append((ts, {}))
-            timeline[-1][1][eid] = int(val)
-        alphas = forward_hmm(session, entry_id, timeline, slot_minutes=args.slot)
-        for (ts, _), prob in zip(timeline, alphas):
-            print(f"{ts.isoformat()}, P(occ)={prob:.3f}")
-    except ValueError as e:
-        print(f"Error: {e}")
-    finally:
-        session.close()
 
 
 def cmd_learn_all(args):
     """Compute priors and likelihoods for all areas."""
     storage = AreaOccupancyStorage()
-    session = storage.get_session()
     try:
         # Get all areas
-        areas = session.query(AreaOccupancy).all()
+        areas = storage.get_all_areas()
         if not areas:
             print("No areas found in the database.")
             return
@@ -296,19 +265,18 @@ def cmd_learn_all(args):
 
             try:
                 # Compute priors
-                session.query(AreaTimePriors).filter_by(entry_id=area.entry_id).delete()
+                storage.delete_area_time_priors(area.entry_id)
                 priors = compute_time_priors(
-                    session, area.entry_id, slot_minutes=args.slot
+                    storage, area.entry_id, slot_minutes=args.slot
                 )
-                session.add_all(priors)
 
                 # Compute likelihoods
-                configs = compute_entity_likelihoods(session, area.entry_id)
+                configs = compute_entity_likelihoods(storage, area.entry_id)
 
                 # Compute area prior
-                area_prior = update_area_prior(session, area.entry_id)
+                area_prior = update_area_prior(storage, area.entry_id)
 
-                session.commit()
+                storage.commit()
 
                 non_zero_priors = len([p for p in priors if p.prior_value > 0])
                 updated_configs = len(
@@ -332,8 +300,7 @@ def cmd_learn_all(args):
 
             except Exception as e:
                 print(f"  ✗ Failed: {e}")
-                failed_areas.append((area.area_name, str(e)))
-                session.rollback()
+                storage.rollback()
 
         # Summary
         print("\n=== SUMMARY ===")
@@ -352,9 +319,7 @@ def cmd_learn_all(args):
 
     except Exception as e:
         print(f"Error: {e}")
-        session.rollback()
-    finally:
-        session.close()
+        storage.rollback()
 
 
 def main():
@@ -384,19 +349,11 @@ def main():
     p.add_argument("entry_id", help="Area entry ID")
     p.set_defaults(func=cmd_area_prior)
 
-    p = sub.add_parser("predict", help="Naïve Bayes occupancy prediction")
-    p.add_argument("entry_id", help="Area entry ID")
-    p.add_argument("--entities", nargs="+", required=True, help="Sensor entity IDs")
-    p.add_argument(
-        "--values", nargs="+", required=True, help="Sensor readings (0 or 1)"
+    p = sub.add_parser(
+        "predict", help="Naïve Bayes occupancy prediction using random historical data"
     )
-    p.set_defaults(func=cmd_predict)
-
-    p = sub.add_parser("hmm", help="HMM-smoothed occupancy over a timeline CSV")
     p.add_argument("entry_id", help="Area entry ID")
-    p.add_argument("--timeline", help="CSV file of timestamp,entity_id,value")
-    p.add_argument("--slot", type=int, default=60, help="Slot size in minutes")
-    p.set_defaults(func=cmd_hmm)
+    p.set_defaults(func=cmd_predict)
 
     p = sub.add_parser(
         "reset",

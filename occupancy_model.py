@@ -6,63 +6,29 @@ import bisect
 import math
 from collections import defaultdict
 from datetime import datetime, timezone
-
-import numpy as np
-from sqlalchemy import func
+from typing import Dict
 
 from db import AreaOccupancyStorage
-
-# Get references to the model classes
-AreaEntityConfig = AreaOccupancyStorage.AreaEntityConfig
-AreaOccupancy = AreaOccupancyStorage.AreaOccupancy
-AreaTimePriors = AreaOccupancyStorage.AreaTimePriors
-StateInterval = AreaOccupancyStorage.StateInterval
+from mock_types import Entity, EntityType, InputType, Likelihood
 
 
-def compute_time_priors(session, entry_id: str, slot_minutes: int = 60):
+def compute_time_priors(
+    storage: AreaOccupancyStorage, entry_id: str, slot_minutes: int = 60
+):
     """
     Estimate P(occupied) per day_of_week and time_slot from motion sensor intervals.
     """
-    # Use a single optimized query with aggregation to reduce data transfer
-    # This prevents loading all intervals into memory
-    interval_aggregates = (
-        session.query(
-            func.extract("dow", StateInterval.start_time).label("day_of_week"),
-            func.floor(
-                (
-                    func.extract("hour", StateInterval.start_time) * 60
-                    + func.extract("minute", StateInterval.start_time)
-                )
-                / slot_minutes
-            ).label("time_slot"),
-            func.sum(StateInterval.duration_seconds).label("total_occupied_seconds"),
-        )
-        .join(AreaEntityConfig, StateInterval.entity_id == AreaEntityConfig.entity_id)
-        .filter(
-            AreaEntityConfig.entry_id == entry_id,
-            AreaEntityConfig.entity_type == "motion",
-            StateInterval.state == "on",
-        )
-        .group_by("day_of_week", "time_slot")
-        .all()
-    )
+    # Get aggregated interval data
+    interval_aggregates = storage.get_interval_aggregates(entry_id, slot_minutes)
 
-    # Get time bounds with a single query
-    time_bounds = (
-        session.query(
-            func.min(StateInterval.start_time).label("first"),
-            func.max(StateInterval.end_time).label("last"),
-        )
-        .join(AreaEntityConfig, StateInterval.entity_id == AreaEntityConfig.entity_id)
-        .filter(AreaEntityConfig.entry_id == entry_id)
-        .first()
-    )
+    # Get time bounds
+    first_time, last_time = storage.get_time_bounds(entry_id)
 
-    if not time_bounds.first or not time_bounds.last:
+    if not first_time or not last_time:
         return []  # No data available
 
     # Calculate total time period
-    days = (time_bounds.last.date() - time_bounds.first.date()).days + 1
+    days = (last_time.date() - first_time.date()).days + 1
     slots_per_day = (24 * 60) // slot_minutes
     slot_duration_seconds = slot_minutes * 60.0
 
@@ -89,43 +55,31 @@ def compute_time_priors(session, entry_id: str, slot_minutes: int = 60):
                 else 0.0
             )
 
-            priors.append(
-                AreaTimePriors(
-                    entry_id=entry_id,
-                    day_of_week=day,
-                    time_slot=slot,
-                    prior_value=p,
-                    data_points=int(total_slot_seconds),
-                    last_updated=now,
-                )
+            # Create the prior object within the storage's session
+            prior = storage.AreaTimePriors(
+                entry_id=entry_id,
+                day_of_week=day,
+                time_slot=slot,
+                prior_value=p,
+                data_points=int(total_slot_seconds),
+                last_updated=now,
             )
+            storage.session.add(prior)
+            priors.append(prior)
 
     return priors
 
 
-def compute_entity_likelihoods(session, entry_id: str):
+def compute_entity_likelihoods(storage: AreaOccupancyStorage, entry_id: str):
     """
     Compute P(sensor=true|occupied) and P(sensor=true|empty) per sensor.
     Use motion-based labels for 'occupied'.
     """
     # Get all sensor configs for this area
-    sensors = session.query(AreaEntityConfig).filter_by(entry_id=entry_id).all()
+    sensors = storage.get_area_entity_configs(entry_id)
 
     # Get truth timeline from motion sensors (sorted for binary search)
-    occupied_intervals = (
-        session.query(StateInterval.start_time, StateInterval.end_time)
-        .join(AreaEntityConfig, StateInterval.entity_id == AreaEntityConfig.entity_id)
-        .filter(
-            AreaEntityConfig.entry_id == entry_id,
-            AreaEntityConfig.entity_type == "motion",
-            StateInterval.state == "on",
-        )
-        .order_by(StateInterval.start_time)  # Sort for efficient lookup
-        .all()
-    )
-
-    # Convert to list of tuples for binary search
-    occupied_times = [(start, end) for start, end in occupied_intervals]
+    occupied_times = storage.get_motion_sensor_intervals(entry_id)
 
     def is_occupied_optimized(ts):
         """Efficiently check if timestamp falls within any occupied interval using binary search."""
@@ -148,11 +102,7 @@ def compute_entity_likelihoods(session, entry_id: str):
         return sensors
 
     # Get all intervals for all sensors in one query
-    all_intervals = (
-        session.query(StateInterval)
-        .filter(StateInterval.entity_id.in_(sensor_entity_ids))
-        .all()
-    )
+    all_intervals = storage.get_sensor_intervals(sensor_entity_ids)
 
     # Group intervals by entity_id for processing
     intervals_by_entity = defaultdict(list)
@@ -194,20 +144,35 @@ def compute_entity_likelihoods(session, entry_id: str):
     return sensors
 
 
-def naive_bayes_predict(configs, features: dict):
+def naive_bayes_predict(entities: Dict[str, Entity]):
     """
     Compute posterior probability of occupancy given current features.
-    features: dict mapping entity_id to boolean or numeric value.
+
+    Args:
+        entities: Dict mapping entity_id to Entity objects containing evidence and likelihood
     """
     # log-space for numerical stability
     log_true = 0.0
     log_false = 0.0
-    for cfg in configs:
-        value = features.get(cfg.entity_id)
-        p_t = cfg.prob_given_true if value else 1 - cfg.prob_given_true
-        p_f = cfg.prob_given_false if value else 1 - cfg.prob_given_false
-        log_true += math.log(p_t) * cfg.weight
-        log_false += math.log(p_f) * cfg.weight
+    for entity in entities.values():
+        value = entity.evidence
+        p_t = (
+            entity.likelihood.prob_given_true
+            if value
+            else 1 - entity.likelihood.prob_given_true
+        )
+        p_f = (
+            entity.likelihood.prob_given_false
+            if value
+            else 1 - entity.likelihood.prob_given_false
+        )
+
+        # Clamp probabilities to avoid log(0) or log(1)
+        p_t = max(0.001, min(0.999, p_t))
+        p_f = max(0.001, min(0.999, p_f))
+
+        log_true += math.log(p_t) * entity.weight
+        log_false += math.log(p_f) * entity.weight
     # convert back
     max_log = max(log_true, log_false)
     true_prob = math.exp(log_true - max_log)
@@ -215,150 +180,27 @@ def naive_bayes_predict(configs, features: dict):
     return true_prob / (true_prob + false_prob)
 
 
-def forward_hmm(
-    session, entry_id: str, features_list: list[dict], slot_minutes: int = 60
-):
-    """
-    Run HMM forward algorithm over a time grid of features,
-    using time priors as initial state probabilities and a learned transition matrix.
-    """
-    # Pre-load priors and configs once (instead of querying repeatedly)
-    priors_query = session.query(AreaTimePriors).filter_by(entry_id=entry_id).all()
-    prior_map = {(p.day_of_week, p.time_slot): p.prior_value for p in priors_query}
-
-    # Pre-load sensor configs once
-    configs = session.query(AreaEntityConfig).filter_by(entry_id=entry_id).all()
-
-    # Estimate transition probabilities
-    a_00 = a_11 = 0.9
-    a_01 = 1 - a_00
-    a_10 = 1 - a_11
-
-    # Process features in batches to reduce memory usage for large datasets
-    BATCH_SIZE = 1000
-    alphas = []
-    prev = None
-
-    for batch_start in range(0, len(features_list), BATCH_SIZE):
-        batch_end = min(batch_start + BATCH_SIZE, len(features_list))
-        batch_features = features_list[batch_start:batch_end]
-
-        for ts, features in batch_features:
-            day, slot = ts.weekday(), (ts.hour * 60 + ts.minute) // slot_minutes
-            pi1 = prior_map.get((day, slot), 0.5)
-            pi0 = 1 - pi1
-
-            # Emission probability (cached configs)
-            e1 = naive_bayes_predict(configs, features)
-            e0 = 1 - e1
-
-            if prev is None:
-                alpha1 = pi1 * e1
-                alpha0 = pi0 * e0
-            else:
-                prev0, prev1 = prev
-                alpha1 = (prev1 * a_11 + prev0 * a_01) * e1
-                alpha0 = (prev0 * a_00 + prev1 * a_10) * e0
-
-            norm = alpha0 + alpha1 or 1
-            prev = (alpha0 / norm, alpha1 / norm)
-            alphas.append(prev[1])
-
-    return alphas
-
-
-def naive_bayes_predict_vectorized(configs, features_batch: list[dict]):
-    """
-    Vectorized version of naive_bayes_predict for processing multiple feature sets efficiently.
-    Falls back to regular processing if numpy is not available.
-
-    Args:
-        configs: List of AreaEntityConfig objects
-        features_batch: List of feature dictionaries
-
-    Returns:
-        List of probabilities
-    """
-    if not features_batch:
-        return []
-
-    # Pre-compute log probabilities for efficiency
-    entity_ids = [cfg.entity_id for cfg in configs]
-    log_true_probs = np.array(
-        [math.log(cfg.prob_given_true) * cfg.weight for cfg in configs]
-    )
-    log_false_probs = np.array(
-        [math.log(1 - cfg.prob_given_true) * cfg.weight for cfg in configs]
-    )
-    log_empty_true_probs = np.array(
-        [math.log(cfg.prob_given_false) * cfg.weight for cfg in configs]
-    )
-    log_empty_false_probs = np.array(
-        [math.log(1 - cfg.prob_given_false) * cfg.weight for cfg in configs]
-    )
-
-    results = []
-    for features in features_batch:
-        # Convert features to numpy array
-        feature_values = np.array(
-            [features.get(entity_id, 0) for entity_id in entity_ids]
-        )
-
-        # Vectorized computation
-        log_true = np.sum(np.where(feature_values, log_true_probs, log_false_probs))
-        log_false = np.sum(
-            np.where(feature_values, log_empty_true_probs, log_empty_false_probs)
-        )
-
-        # Convert back to probability
-        max_log = max(log_true, log_false)
-        true_prob = math.exp(log_true - max_log)
-        false_prob = math.exp(log_false - max_log)
-
-        results.append(true_prob / (true_prob + false_prob))
-
-    return results
-
-
-def calculate_area_prior(session, entry_id: str) -> float:
+def calculate_area_prior(storage: AreaOccupancyStorage, entry_id: str) -> float:
     """
     Calculate the overall occupancy prior for an area based on historical motion sensor data.
 
     Args:
-        session: Database session
+        storage: AreaOccupancyStorage instance
         entry_id: Area entry ID
 
     Returns:
         float: Prior probability of occupancy (0.0 to 1.0)
     """
     # Get total occupied time from motion sensors
-    occupied_result = (
-        session.query(func.sum(StateInterval.duration_seconds))
-        .join(AreaEntityConfig, StateInterval.entity_id == AreaEntityConfig.entity_id)
-        .filter(
-            AreaEntityConfig.entry_id == entry_id,
-            AreaEntityConfig.entity_type == "motion",
-            StateInterval.state == "on",
-        )
-        .scalar()
-    )
+    total_occupied_seconds = storage.get_total_occupied_seconds(entry_id)
 
     # Get total time period
-    time_bounds = (
-        session.query(
-            func.min(StateInterval.start_time).label("first"),
-            func.max(StateInterval.end_time).label("last"),
-        )
-        .join(AreaEntityConfig, StateInterval.entity_id == AreaEntityConfig.entity_id)
-        .filter(AreaEntityConfig.entry_id == entry_id)
-        .first()
-    )
+    first_time, last_time = storage.get_time_bounds(entry_id)
 
-    if not time_bounds.first or not time_bounds.last or not occupied_result:
+    if not first_time or not last_time or total_occupied_seconds == 0:
         return 0.5  # Default prior if no data
 
-    total_occupied_seconds = float(occupied_result or 0)
-    total_seconds = (time_bounds.last - time_bounds.first).total_seconds()
+    total_seconds = (last_time - first_time).total_seconds()
 
     if total_seconds <= 0:
         return 0.5
@@ -366,46 +208,140 @@ def calculate_area_prior(session, entry_id: str) -> float:
     return total_occupied_seconds / total_seconds
 
 
-def update_area_prior(session, entry_id: str) -> float:
+def update_area_prior(storage: AreaOccupancyStorage, entry_id: str) -> float:
     """
     Calculate and update the area prior for a specific area.
 
     Args:
-        session: Database session
+        storage: AreaOccupancyStorage instance
         entry_id: Area entry ID
 
     Returns:
         float: The calculated prior value
     """
-
-    prior_value = calculate_area_prior(session, entry_id)
-
-    # Update the area record
-    area = session.query(AreaOccupancy).filter_by(entry_id=entry_id).first()
-    if area:
-        area.area_prior = prior_value
-        area.updated_at = datetime.now(timezone.utc)
-        session.commit()
-
+    prior_value = calculate_area_prior(storage, entry_id)
+    storage.update_area_prior(entry_id, prior_value)
     return prior_value
 
 
-def update_all_area_priors(session) -> dict[str, float]:
+def create_features_from_entities(entities: Dict[str, Entity]) -> Dict[str, Entity]:
+    """
+    Create features dictionary from Entity objects for use with naive_bayes_predict.
+
+    Args:
+        entities: Dictionary mapping entity_id to Entity objects
+
+    Returns:
+        Dict[str, Entity]: Features dictionary mapping entity_id to Entity objects
+    """
+    features = {}
+    for entity_id, entity_data in entities.items():
+        # Create Feature object from Entity data
+        features[entity_id] = entity_data
+
+    return features
+
+
+def generate_entities_from_db(
+    storage: AreaOccupancyStorage, entry_id: str
+) -> Dict[str, Entity]:
+    """
+    Generate Entity objects from database configurations for an area.
+
+    Args:
+        storage: AreaOccupancyStorage instance
+        entry_id: Area entry ID
+
+    Returns:
+        Dict[str, Entity]: Dictionary mapping entity_id to Entity objects
+    """
+    # Get all sensor configs for this area
+    configs = storage.get_area_entity_configs(entry_id)
+
+    entities = {}
+    for cfg in configs:
+        # Convert string entity_type to InputType enum
+        try:
+            input_type = InputType(cfg.entity_type)
+        except ValueError:
+            # Default to MOTION if entity_type is not in InputType enum
+            input_type = InputType.MOTION
+
+        # Create EntityType from config
+        entity_type = EntityType(input_type=input_type, weight=cfg.weight)
+
+        # Create Likelihood from config
+        likelihood = Likelihood(
+            prob_given_true=cfg.prob_given_true,
+            prob_given_false=cfg.prob_given_false,
+        )
+
+        # Create Entity object
+        entity = Entity(
+            entity_id=cfg.entity_id,
+            entity_type=entity_type,
+            weight=cfg.weight,
+            likelihood=likelihood,
+        )
+
+        entities[cfg.entity_id] = entity
+
+    return entities
+
+
+def prepare_features_for_prediction(
+    storage: AreaOccupancyStorage, entry_id: str, entities: Dict[str, Entity]
+) -> Dict[str, Entity]:
+    """
+    Prepare complete features dictionary for naive_bayes_predict.
+    Ensures all required sensors for the area are present with default values for missing ones.
+
+    Args:
+        storage: AreaOccupancyStorage instance
+        entry_id: Area entry ID
+        entities: Dictionary mapping entity_id to Entity objects
+
+    Returns:
+        Dict[str, Entity]: Complete features dictionary with all required sensors
+    """
+    # Get all sensor configs for this area
+    configs = storage.get_area_entity_configs(entry_id)
+
+    # Create features from provided entities
+    features = create_features_from_entities(entities)
+
+    # Ensure all required sensors are present with default values
+    for cfg in configs:
+        if cfg.entity_id not in features:
+            # Add missing sensor with default False evidence
+            features[cfg.entity_id] = Entity(
+                entity_id=cfg.entity_id,
+                entity_type=cfg.entity_type,
+                weight=cfg.weight,
+                likelihood=Likelihood(
+                    prob_given_true=cfg.prob_given_true,
+                    prob_given_false=cfg.prob_given_false,
+                ),
+            )
+
+    return features
+
+
+def update_all_area_priors(storage: AreaOccupancyStorage) -> dict[str, float]:
     """
     Calculate and update area priors for all areas in the database.
 
     Args:
-        session: Database session
+        storage: AreaOccupancyStorage instance
 
     Returns:
         dict: Mapping of entry_id to prior value
     """
-
-    areas = session.query(AreaOccupancy).all()
+    areas = storage.get_all_areas()
     results = {}
 
     for area in areas:
-        prior_value = update_area_prior(session, area.entry_id)
+        prior_value = update_area_prior(storage, area.entry_id)
         results[area.entry_id] = prior_value
 
     return results

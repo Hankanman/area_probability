@@ -1,0 +1,9 @@
+{
+    "entity_id": "motion_sensor_1",
+    "entity_type": "motion",
+    "evidence": false,
+    "likelihood": {
+        "prob_given_true": 0.9,
+        "prob_given_false": 0.1
+    }
+}
